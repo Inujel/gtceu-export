@@ -1,0 +1,6 @@
+{
+    "pack": {
+        "description": "GTCEu Calculator Export resources",
+        "pack_format": ${pack_format}
+    }
+}

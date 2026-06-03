@@ -1,0 +1,60 @@
+plugins {
+    id 'java'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+group   = 'com.gtceucalculator'
+version = '1.0.0'
+
+// pack_format value for pack.mcmeta, varies by MC version:
+//   1.18.x → 8 | 1.19.x → 9 | 1.20.x → 15
+def packFormat = mc_version.startsWith('1.18') ? 8
+               : mc_version.startsWith('1.19') ? 9
+               : 15
+
+minecraft {
+    mappings channel: 'official', version: mc_version
+    copyIdeResources = true
+
+    runs {
+        // For local testing only — not needed to produce the distributable JAR.
+        server {
+            workingDirectory project.file('run')
+            property 'forge.logging.console.level', 'info'
+            mods {
+                gtceu_calculator_export { source sourceSets.main }
+            }
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${mc_version}-${forge_version}"
+}
+
+// Inject the correct pack_format into pack.mcmeta at build time.
+processResources {
+    inputs.property 'pack_format', packFormat
+    filesMatching('pack.mcmeta') {
+        expand pack_format: packFormat
+    }
+}
+
+// Name the JAR after the target MC version for clarity when distributing.
+jar {
+    archiveBaseName = 'gtceu_calculator_export'
+    archiveClassifier = "mc${mc_version}"
+    manifest {
+        attributes([
+            'Specification-Title'   : 'gtceu_calculator_export',
+            'Specification-Version' : '1',
+            'Implementation-Title'  : project.name,
+            'Implementation-Version': project.jar.archiveVersion,
+        ])
+    }
+}

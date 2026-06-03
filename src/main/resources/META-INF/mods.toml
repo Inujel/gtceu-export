@@ -1,0 +1,25 @@
+modLoader   = "javafml"
+loaderVersion = "[40,)"
+license     = "MIT"
+# Tells Forge this mod is client-only: servers don't need it and won't warn about a version mismatch.
+displayTest = "IGNORE_SERVER_VERSION"
+
+[[mods]]
+    modId       = "gtceu_calculator_export"
+    version     = "1.0.0"
+    displayName = "GTCEu Calculator Export"
+    description = "Exports item/fluid/recipe data and rendered icons for the GTCEu Calculator tool."
+
+[[dependencies.gtceu_calculator_export]]
+    modId        = "forge"
+    mandatory    = true
+    versionRange = "[40,)"
+    ordering     = "NONE"
+    side         = "CLIENT"
+
+[[dependencies.gtceu_calculator_export]]
+    modId        = "minecraft"
+    mandatory    = true
+    versionRange = "[1.18.2,)"
+    ordering     = "NONE"
+    side         = "CLIENT"
