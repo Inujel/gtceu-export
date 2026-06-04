@@ -4,8 +4,8 @@ plugins {
 }
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
-group   = 'com.gtceucalculator'
-version = '1.0.0'
+group   = 'org.jjhub.gtceucalculator'
+version = '1.1.0'
 
 // pack_format value for pack.mcmeta, varies by MC version:
 //   1.18.x → 8 | 1.19.x → 9 | 1.20.x → 15
@@ -53,7 +53,7 @@ jar {
         attributes([
             'Specification-Title'   : 'gtceu_calculator_export',
             'Specification-Version' : '1',
-            'Implementation-Title'  : project.name,
+            'Implementation-Title'  : 'GTCEu Calculator Export',
             'Implementation-Version': project.jar.archiveVersion,
         ])
     }

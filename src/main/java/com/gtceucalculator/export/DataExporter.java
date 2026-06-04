@@ -1,4 +1,4 @@
-package com.gtceucalculator.export;
+package org.jjhub.gtceucalculator.export;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -26,8 +26,11 @@ import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.Tesselator;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.mojang.brigadier.context.CommandContext;
+import net.minecraft.commands.CommandSourceStack;
 import net.minecraftforge.api.distmarker.Dist;
-import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
+import net.minecraftforge.client.event.RegisterClientCommandsEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.loading.FMLPaths;
@@ -49,35 +52,59 @@ public class DataExporter {
     private static final Logger LOG  = LogManager.getLogger(ExportMod.MOD_ID);
     private static final Gson   GSON = new GsonBuilder().setPrettyPrinting().create();
 
-    // Fired when the client player finishes logging in.
-    // At this point tags, recipes, and models are all synced and ready.
     @SubscribeEvent
-    public static void onLoggedIn(ClientPlayerNetworkEvent.LoggingIn event) {
+    public static void onRegisterClientCommands(RegisterClientCommandsEvent event) {
+        event.getDispatcher().register(
+            LiteralArgumentBuilder.<CommandSourceStack>literal("gtceuexport")
+                .then(LiteralArgumentBuilder.<CommandSourceStack>literal("catalog")
+                    .executes(DataExporter::runExportCatalog))
+                .then(LiteralArgumentBuilder.<CommandSourceStack>literal("icons")
+                    .executes(DataExporter::runExportIcons))
+        );
+    }
+
+    private static int runExportCatalog(CommandContext<CommandSourceStack> ctx) {
         Minecraft mc = Minecraft.getInstance();
-        // Defer one tick so the client state is fully settled before we start rendering.
         mc.execute(() -> {
             try {
                 Path outDir = FMLPaths.GAMEDIR.get().resolve("gtceu_calculator_export");
                 Files.createDirectories(outDir);
-                exportItems(outDir);
-                exportFluids(outDir);
-                exportRecipes(outDir, mc);
-                exportIcons(outDir, mc);
-                exportFluidIcons(outDir, mc);
-                LOG.info("[gtceu_calculator_export] Export complete → {}", outDir.toAbsolutePath());
+                Map<String, Map<String, Object>> catalog = new TreeMap<>();
+                catalog.put("items", new TreeMap<String, Object>());
+                catalog.put("recipes", new TreeMap<String, Object>());
+                collectItems(catalog.get("items"));
+                collectFluids(catalog.get("items"));
+                collectRecipes(catalog.get("recipes"), mc);
+                try (java.io.Writer w = Files.newBufferedWriter(outDir.resolve("catalog.json"))) {
+                    GSON.toJson(catalog, w);
+                }
+                LOG.info("[gtceu_calculator_export] catalog.json → {}", outDir.toAbsolutePath());
             } catch (Exception e) {
-                LOG.error("[gtceu_calculator_export] Export failed", e);
+                LOG.error("[gtceu_calculator_export] Catalog export failed", e);
             }
         });
+        return 1;
     }
 
-    // ── Items ────────────────────────────────────────────────────────────────
-    // Output: items.json — { "mod:item_id": { "name": "Display Name", "tags": [...] } }
+    private static int runExportIcons(CommandContext<CommandSourceStack> ctx) {
+        Minecraft mc = Minecraft.getInstance();
+        mc.execute(() -> {
+            try {
+                Path outDir = FMLPaths.GAMEDIR.get().resolve("gtceu_calculator_export");
+                Files.createDirectories(outDir);
+                exportIcons(outDir, mc);
+                exportFluidIcons(outDir, mc);
+                LOG.info("[gtceu_calculator_export] Icons → {}", outDir.toAbsolutePath());
+            } catch (Exception e) {
+                LOG.error("[gtceu_calculator_export] Icons export failed", e);
+            }
+        });
+        return 1;
+    }
 
-    private static void exportItems(Path outDir) throws IOException {
+    private static void collectItems(Map<String, Object> items) throws IOException {
         Map<String, List<String>> tagsByItem = invertTagMap(ForgeRegistries.ITEMS);
 
-        Map<String, Object> items = new TreeMap<>();
         ForgeRegistries.ITEMS.forEach(item -> {
             ResourceLocation id = ForgeRegistries.ITEMS.getKey(item);
             if (id == null || "minecraft:air".equals(id.toString())) return;
@@ -88,17 +115,12 @@ public class DataExporter {
             items.put(id.toString(), info);
         });
 
-        Files.writeString(outDir.resolve("items.json"), GSON.toJson(items));
         LOG.info("[gtceu_calculator_export] items.json — {} items", items.size());
     }
 
-    // ── Fluids ───────────────────────────────────────────────────────────────
-    // Output: fluids.json — { "mod:fluid_id": { "name": "Display Name", "tags": [...] } }
-
-    private static void exportFluids(Path outDir) throws IOException {
+    private static void collectFluids(Map<String, Object> fluids) throws IOException {
         Map<String, List<String>> tagsByFluid = invertTagMap(ForgeRegistries.FLUIDS);
 
-        Map<String, Object> fluids = new TreeMap<>();
         ForgeRegistries.FLUIDS.forEach(fluid -> {
             ResourceLocation id = ForgeRegistries.FLUIDS.getKey(fluid);
             if (id == null || "minecraft:empty".equals(id.toString())) return;
@@ -109,7 +131,6 @@ public class DataExporter {
             fluids.put(id.toString(), info);
         });
 
-        Files.writeString(outDir.resolve("fluids.json"), GSON.toJson(fluids));
         LOG.info("[gtceu_calculator_export] fluids.json — {} fluids", fluids.size());
     }
 
@@ -117,13 +138,12 @@ public class DataExporter {
     // Output: recipes.json — array of { "id", "type", "data": <full serialized recipe> }
     // Falls back to { "output", "inputs" } for serializers without a codec.
 
-    private static void exportRecipes(Path outDir, Minecraft mc) throws IOException {
+    private static void collectRecipes(Map<String, Object> recipes, Minecraft mc) throws IOException {
         if (mc.getConnection() == null) {
             LOG.warn("[gtceu_calculator_export] No connection — skipping recipe export");
             return;
         }
 
-        List<Map<String, Object>> list = new ArrayList<>();
         for (Recipe<?> recipe : mc.getConnection().getRecipeManager().getRecipes()) {
             Map<String, Object> r = new LinkedHashMap<>();
             r.put("id",   recipe.getId().toString());
@@ -156,11 +176,10 @@ public class DataExporter {
                 } catch (Exception ignored) { }
             }
 
-            list.add(r);
+            recipes.put(recipe.getId().toString(), r);
         }
 
-        Files.writeString(outDir.resolve("recipes.json"), GSON.toJson(list));
-        LOG.info("[gtceu_calculator_export] recipes.json — {} recipes", list.size());
+        LOG.info("[gtceu_calculator_export] recipes.json — {} recipes", recipes.size());
     }
 
     // ── Icons ────────────────────────────────────────────────────────────────

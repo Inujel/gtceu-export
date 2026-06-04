@@ -1,4 +1,4 @@
-package com.gtceucalculator.export;
+package org.jjhub.gtceucalculator.export;
 
 import net.minecraftforge.fml.common.Mod;
 
