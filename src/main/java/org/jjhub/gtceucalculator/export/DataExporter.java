@@ -19,6 +19,7 @@ import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.Recipe;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraftforge.client.extensions.common.IClientFluidTypeExtensions;
@@ -29,6 +30,7 @@ import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.RegisterClientCommandsEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
@@ -37,10 +39,16 @@ import net.minecraftforge.fml.loading.FMLPaths;
 import net.minecraftforge.registries.ForgeRegistries;
 import net.minecraftforge.registries.IForgeRegistry;
 import net.minecraftforge.registries.tags.ITagManager;
+import com.gregtechceu.gtceu.api.recipe.GTRecipe;
+import com.gregtechceu.gtceu.api.recipe.content.Content;
+import com.gregtechceu.gtceu.api.capability.recipe.ItemRecipeCapability;
+import com.gregtechceu.gtceu.api.capability.recipe.FluidRecipeCapability;
+import com.gregtechceu.gtceu.api.recipe.ingredient.EnergyStack;
+import com.gregtechceu.gtceu.api.recipe.ingredient.SizedIngredient;
+import com.gregtechceu.gtceu.api.recipe.ingredient.FluidIngredient;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.joml.Matrix4f;
-
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -146,12 +154,18 @@ public class DataExporter {
 
         for (Recipe<?> recipe : mc.getConnection().getRecipeManager().getRecipes()) {
             Map<String, Object> r = new LinkedHashMap<>();
-            r.put("id",   recipe.getId().toString());
-            ResourceLocation typeId = ForgeRegistries.RECIPE_SERIALIZERS.getKey(recipe.getSerializer());
-            r.put("type", typeId != null ? typeId.toString() : "unknown");
+            r.put("id", recipe.getId().toString());
 
-            // 1.20.1 RecipeSerializer has no codec(); always use the output+inputs fallback.
-            {
+            // Prefer the RecipeType registry key (gives specific machine type for GTCEu,
+            // e.g. "gtceu:macerator" rather than the generic serializer key "gtceu:machine").
+            ResourceLocation typeKey = BuiltInRegistries.RECIPE_TYPE.getKey(recipe.getType());
+            if (typeKey == null)
+                typeKey = ForgeRegistries.RECIPE_SERIALIZERS.getKey(recipe.getSerializer());
+            r.put("type", typeKey != null ? typeKey.toString() : "unknown");
+
+            boolean handledAsGT = tryExportAsGTRecipe(r, recipe);
+            if (!handledAsGT) {
+                // Standard MC recipe fallback (shaped, shapeless, smelting, …)
                 try {
                     ItemStack out = recipe.getResultItem(mc.level != null
                         ? mc.level.registryAccess() : net.minecraft.core.RegistryAccess.EMPTY);
@@ -164,22 +178,139 @@ public class DataExporter {
                     List<List<String>> inputs = new ArrayList<>();
                     recipe.getIngredients().forEach(ing -> {
                         List<String> opts = new ArrayList<>();
-                        JsonElement json = ing.toJson();
-                        if (json.isJsonArray()) {
-                            json.getAsJsonArray().forEach(el -> extractIngredientRef(el.getAsJsonObject(), opts));
-                        } else if (json.isJsonObject()) {
-                            extractIngredientRef(json.getAsJsonObject(), opts);
-                        }
+                        extractIngredientRefs(ing.toJson(), opts);
                         if (!opts.isEmpty()) inputs.add(opts);
                     });
                     r.put("inputs", inputs);
-                } catch (Exception ignored) { }
+                } catch (Exception ignored) {}
             }
 
             recipes.put(recipe.getId().toString(), r);
         }
 
         LOG.info("[gtceu_calculator_export] recipes.json — {} recipes", recipes.size());
+    }
+
+    
+    /**
+     * Attempts to populate {@code r} with GTCEu-specific recipe fields.
+     *
+     * @return {@code true} if {@code recipe} is a {@code GTRecipe};
+     *         {@code false} if it is a standard MC recipe.
+     */
+    private static boolean tryExportAsGTRecipe(Map<String, Object> r, Recipe<?> recipe) {
+        if (!(recipe instanceof GTRecipe gt)) return false;
+
+        r.put("duration", gt.duration);
+
+        // EU/t via getInputEUt() — returns EnergyStack(voltage, amperage).
+        // For consumer recipes (crafting machines): inputEut is set, outputEut is empty.
+        // For generator recipes (turbines, combustion, etc.): inputEut is empty, outputEut is set.
+        // We export outputEut as a negative eut so recipe.py can detect the sign.
+        EnergyStack inputEut = gt.getInputEUt();
+        if (!inputEut.isEmpty()) {
+            r.put("eut", inputEut.voltage());
+        } else {
+            EnergyStack outputEut = gt.getOutputEUt();
+            if (!outputEut.isEmpty()) r.put("eut", -outputEut.voltage());
+        }
+
+        // Item inputs → [{"refs":[ref, …], "count":N}, …]
+        List<Map<String, Object>> itemInputSlots = new ArrayList<>();
+        for (Content ct : gt.inputs.getOrDefault(ItemRecipeCapability.CAP, List.of())) {
+            Ingredient ing = (Ingredient) ct.content;
+            int count = (ing instanceof SizedIngredient s) ? s.getAmount() : 1;
+            List<String> refs = ingredientRefs(ing);
+            if (refs.isEmpty()) continue;
+            Map<String, Object> slot = new LinkedHashMap<>();
+            slot.put("refs", refs);
+            if (count != 1) slot.put("count", count);
+            if (ct.isChanced()) slot.put("chance", (double) ct.chance / ct.maxChance);
+            itemInputSlots.add(slot);
+        }
+        r.put("inputs", itemInputSlots);
+
+        // Fluid inputs → [{"fluid","mb"}, …]
+        List<Map<String, Object>> fluidInputs = new ArrayList<>();
+        for (Content ct : gt.inputs.getOrDefault(FluidRecipeCapability.CAP, List.of())) {
+            Map<String, Object> m = fluidToMap((FluidIngredient) ct.content, ct.chance, ct.maxChance);
+            if (m != null) fluidInputs.add(m);
+        }
+        if (!fluidInputs.isEmpty()) r.put("fluid_inputs", fluidInputs);
+
+        // Item outputs → [{"item","count",?"chance"}, …]
+        List<Map<String, Object>> itemOutputs = new ArrayList<>();
+        for (Content ct : gt.outputs.getOrDefault(ItemRecipeCapability.CAP, List.of())) {
+            Ingredient ing = (Ingredient) ct.content;
+            int count = (ing instanceof SizedIngredient s) ? s.getAmount() : 1;
+            List<String> refs = ingredientRefs(ing);
+            if (refs.isEmpty()) continue;
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("item", refs.get(0));
+            if (count != 1) m.put("count", count);
+            if (ct.isChanced())
+                m.put("chance", (double) ct.chance / ct.maxChance);
+            itemOutputs.add(m);
+        }
+        if (!itemOutputs.isEmpty()) r.put("outputs", itemOutputs);
+
+        // Fluid outputs → [{"fluid","mb",?"chance"}, …]
+        List<Map<String, Object>> fluidOutputs = new ArrayList<>();
+        for (Content ct : gt.outputs.getOrDefault(FluidRecipeCapability.CAP, List.of())) {
+            Map<String, Object> m = fluidToMap((FluidIngredient) ct.content, ct.chance, ct.maxChance);
+            if (m != null) fluidOutputs.add(m);
+        }
+        if (!fluidOutputs.isEmpty()) r.put("fluid_outputs", fluidOutputs);
+
+        return true;
+    }
+
+    // ── GTCEu helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Extracts item/tag refs from an ingredient, unwrapping {@code SizedIngredient} first.
+     * Uses {@link #extractIngredientRefs} on the inner Ingredient's JSON.
+     */
+    private static List<String> ingredientRefs(Ingredient ing) {
+        Ingredient base = (ing instanceof SizedIngredient s) ? s.getInner() : ing;
+        List<String> refs = new ArrayList<>();
+        extractIngredientRefs(base.toJson(), refs);
+        return refs;
+    }
+    
+    /**
+     * Converts a {@link FluidIngredient} to a {"fluid"/"tag", "mb", ?"chance"} map.
+     * {@code FluidIngredient.toJson()} format: {@code {"amount":mb, "value":[{"fluid":"ns:id"}]}}.
+     * @param chance    raw int chance (0–maxChance)
+     * @param maxChance denominator for the chance fraction (typically 10000)
+     */
+    private static Map<String, Object> fluidToMap(FluidIngredient fi, int chance, int maxChance) {
+        try {
+            JsonObject json = fi.toJson().getAsJsonObject();
+            long mb = json.get("amount").getAsLong();
+
+            // "value" is always a JsonArray in FluidIngredient.toJson() (see source).
+            JsonElement valElem = json.get("value");
+            JsonObject valueObj;
+            if (valElem != null && valElem.isJsonArray() && valElem.getAsJsonArray().size() > 0) {
+                valueObj = valElem.getAsJsonArray().get(0).getAsJsonObject();
+            } else if (valElem != null && valElem.isJsonObject()) {
+                valueObj = valElem.getAsJsonObject();
+            } else {
+                return null;
+            }
+
+            Map<String, Object> m = new LinkedHashMap<>();
+            if      (valueObj.has("fluid")) m.put("fluid", valueObj.get("fluid").getAsString());
+            else if (valueObj.has("tag"))   m.put("tag",   "#" + valueObj.get("tag").getAsString());
+            else return null;
+            m.put("mb", mb);
+            if (chance < maxChance)
+                m.put("chance", (double) chance / maxChance);
+            return m;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     // ── Icons ────────────────────────────────────────────────────────────────
@@ -337,12 +468,28 @@ public class DataExporter {
 
     // ── Utilities ────────────────────────────────────────────────────────────
 
-    // Extracts "#namespace:tag" or "namespace:item" from a single ingredient JSON entry.
-    private static void extractIngredientRef(JsonObject obj, List<String> out) {
-        if (obj.has("tag")) {
-            out.add("#" + obj.get("tag").getAsString());
-        } else if (obj.has("item")) {
-            out.add(obj.get("item").getAsString());
+
+    /**
+     * Recursively extracts {@code "namespace:id"} or {@code "#namespace:tag"} strings
+     * from an ingredient JsonElement.
+     * Handles: plain {@code {"item":…}}/{"tag":…}, arrays of alternatives, and
+     * GTCEu SizedIngredient format {@code {"count":N, "ingredient":{…}}}.
+     */
+    private static void extractIngredientRefs(JsonElement json, List<String> out) {
+        if (json.isJsonArray()) {
+            json.getAsJsonArray().forEach(el -> {
+                if (el.isJsonObject()) extractIngredientRefs(el, out);
+            });
+        } else if (json.isJsonObject()) {
+            JsonObject obj = json.getAsJsonObject();
+            if (obj.has("ingredient")) {
+                // SizedIngredient wrapper: {"count": N, "ingredient": {…}}
+                extractIngredientRefs(obj.get("ingredient"), out);
+            } else if (obj.has("tag")) {
+                out.add("#" + obj.get("tag").getAsString());
+            } else if (obj.has("item")) {
+                out.add(obj.get("item").getAsString());
+            }
         }
     }
 
